@@ -572,40 +572,6 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(rewritten)
         }
-        Err(litebox_syscall_rewriter::Error::AlreadyHooked) => {
-            eprintln!(
-                "  warning: {} is already hooked, using as-is",
-                path.display()
-            );
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::NoSyscallInstructionsFound) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} has no syscall instructions, using as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::UnsupportedObjectFile) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} is not a supported ELF, including as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::NoTextSectionFound) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} has no .text section, using as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
         Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
     }
 }

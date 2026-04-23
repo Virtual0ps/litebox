@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -169,9 +169,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
-                .unwrap()
-                .into()
+            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
+                .with_context(|| format!("failed to rewrite {}", prog.display()))?;
+            rewritten.into()
         } else {
             let data = file.data.into();
             cow_eligible_regions.push(file);

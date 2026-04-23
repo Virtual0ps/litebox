@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
@@ -56,9 +56,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let ldelf_data: Vec<u8> = {
         let ldelf = PathBuf::from(&cli_args.ldelf);
-        let data = std::fs::read(ldelf).unwrap();
+        let data =
+            std::fs::read(&ldelf).with_context(|| format!("failed to read {}", cli_args.ldelf))?;
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
+                .with_context(|| format!("failed to rewrite {}", cli_args.ldelf))?
         } else {
             data
         }
@@ -66,9 +68,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let prog_data: Vec<u8> = {
         let prog = PathBuf::from(&cli_args.program);
-        let data = std::fs::read(prog).unwrap();
+        let data =
+            std::fs::read(&prog).with_context(|| format!("failed to read {}", cli_args.program))?;
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
+                .with_context(|| format!("failed to rewrite {}", cli_args.program))?
         } else {
             data
         }
