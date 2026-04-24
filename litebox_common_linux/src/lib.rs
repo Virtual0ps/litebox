@@ -14,7 +14,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt},
 };
 use syscalls::Sysno;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::signal::SigSet;
 
@@ -674,7 +674,7 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Ucred {
     pub pid: u32,
@@ -767,7 +767,7 @@ impl From<Duration> for Timespec32 {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
 pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
