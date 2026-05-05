@@ -1,18 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Restrict this crate to only work on Linux, as it relies on `ldd` for
-// dependency discovery and other Linux-specific functionality.
-#![cfg(target_os = "linux")]
-
 #[cfg(target_arch = "x86_64")]
 pub mod oci;
 
 use anyhow::{Context, bail};
 use clap::Parser;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::MetadataExt as _;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tar::{Builder, Header};
 
@@ -48,10 +45,16 @@ pub struct CliArgs {
     #[arg(short = 'o', long = "output", default_value = "litebox_packager.tar")]
     pub output: PathBuf,
 
-    /// Include extra files in the tar.
+    /// Include extra files in the tar (host mode only).
+    /// ELF files are automatically run through the syscall rewriter; non-ELF
+    /// files are included as-is.
     /// Format: HOST_PATH:TAR_PATH (split on the first colon, so the tar path
     /// may contain colons but the host path must not).
-    #[arg(long = "include", value_name = "HOST_PATH:TAR_PATH")]
+    #[arg(
+        long = "include",
+        value_name = "HOST_PATH:TAR_PATH",
+        conflicts_with = "oci_image"
+    )]
     pub include: Vec<String>,
 
     /// Skip rewriting specific files (by their absolute path on the host).
@@ -64,11 +67,13 @@ pub struct CliArgs {
 }
 
 /// Parsed `--include` entry.
+#[cfg(target_os = "linux")]
 struct IncludeEntry {
     host_path: PathBuf,
     tar_path: String,
 }
 
+#[cfg(target_os = "linux")]
 fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
     let Some(colon_idx) = spec.find(':') else {
         bail!("invalid --include format: expected HOST_PATH:TAR_PATH, got: {spec}");
@@ -99,7 +104,24 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    // --- Phase 1: Validate inputs ---
+    // Host mode (local ELF files + ldd dependency discovery) is Linux-only.
+    #[cfg(target_os = "linux")]
+    {
+        run_host_mode(args)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        bail!(
+            "Host mode (local ELF files) is only supported on Linux. \
+             Use --oci-image to pull a container image instead."
+        );
+    }
+}
+
+/// Host mode: package local ELF files with ldd-based dependency discovery.
+#[cfg(target_os = "linux")]
+fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
     let input_files: Vec<PathBuf> = args
         .input_files
         .iter()
@@ -151,12 +173,15 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
 
     let par_results: Vec<anyhow::Result<Vec<TarEntry>>> = file_map_vec
         .into_par_iter()
-        .map(|(real_path, tar_paths)| {
+        .map(|(real_path, tar_paths): (&PathBuf, &Vec<PathBuf>)| {
             let data = std::fs::read(real_path)
                 .with_context(|| format!("failed to read {}", real_path.display()))?;
-            let mode = std::fs::metadata(real_path)
-                .with_context(|| format!("failed to stat {}", real_path.display()))?
-                .mode();
+            let mode = {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(real_path)
+                    .with_context(|| format!("failed to stat {}", real_path.display()))?
+                    .mode()
+            };
 
             let rewritten = if no_rewrite.contains(real_path) {
                 if verbose {
@@ -164,7 +189,7 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
                 }
                 data
             } else {
-                rewrite_elf(&data, real_path, verbose)?
+                rewrite_elf(&data, real_path, verbose)
             };
 
             let mut entries = Vec::new();
@@ -194,7 +219,45 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, added_tar_paths, &args)?;
+    // Append --include files (ELF files are automatically rewritten).
+    let includes: Vec<IncludeEntry> = args
+        .include
+        .iter()
+        .map(|s| parse_include(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for inc in &includes {
+        if !inc.host_path.exists() {
+            bail!("included file does not exist: {}", inc.host_path.display());
+        }
+        if !added_tar_paths.insert(inc.tar_path.clone()) {
+            bail!(
+                "duplicate tar path from --include: '{}' (already present)",
+                inc.tar_path
+            );
+        }
+        let data = std::fs::read(&inc.host_path)
+            .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
+        let mode = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
+        };
+        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose);
+        if args.verbose {
+            eprintln!(
+                "  including {} as {}",
+                inc.host_path.display(),
+                inc.tar_path
+            );
+        }
+        tar_entries.push(TarEntry {
+            tar_path: inc.tar_path.clone(),
+            data: rewritten,
+            mode,
+        });
+    }
+
+    finalize_tar(tar_entries, &args)?;
 
     Ok(())
 }
@@ -208,7 +271,12 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
 
     // --- Phase 2: Scan rootfs for files ---
     eprintln!("Scanning rootfs...");
-    let file_map = oci::scan_rootfs(&extracted.rootfs_path, args.verbose)?;
+    let file_map = oci::scan_rootfs(
+        &extracted.rootfs_path,
+        &extracted.symlink_map,
+        &extracted.permissions,
+        args.verbose,
+    )?;
 
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
@@ -241,7 +309,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
             let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)?
+                rewrite_elf(&data, &entry.read_path, verbose)
             } else {
                 data
             };
@@ -303,76 +371,17 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, added_tar_paths, args)?;
+    finalize_tar(tar_entries, args)?;
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Shared finalization: includes, rtld audit injection, tar build, size report
+// Shared finalization: tar build, size report
 // ---------------------------------------------------------------------------
 
-/// Append `--include` files, inject the rtld audit library, build the output
-/// tar, and print a size summary.
-///
-/// Both host mode and OCI mode call this after producing their rewritten
-/// `TarEntry` list.
-fn finalize_tar(
-    mut tar_entries: Vec<TarEntry>,
-    mut added_tar_paths: BTreeSet<String>,
-    args: &CliArgs,
-) -> anyhow::Result<()> {
-    // Parse and append --include files.
-    let includes: Vec<IncludeEntry> = args
-        .include
-        .iter()
-        .map(|s| parse_include(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    for inc in &includes {
-        if !inc.host_path.exists() {
-            bail!("included file does not exist: {}", inc.host_path.display());
-        }
-        if !added_tar_paths.insert(inc.tar_path.clone()) {
-            bail!(
-                "duplicate tar path from --include: '{}' (already present)",
-                inc.tar_path
-            );
-        }
-        let data = std::fs::read(&inc.host_path)
-            .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
-        let mode = std::fs::metadata(&inc.host_path).map_or(0o644, |m| m.mode());
-        if args.verbose {
-            eprintln!(
-                "  including {} as {}",
-                inc.host_path.display(),
-                inc.tar_path
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data,
-            mode,
-        });
-    }
-
-    // Include the rtld audit library so the rewriter backend can load it.
-    #[cfg(target_arch = "x86_64")]
-    {
-        const RTLD_AUDIT_TAR_PATH: &str = "lib/litebox_rtld_audit.so";
-        if !added_tar_paths.insert(RTLD_AUDIT_TAR_PATH.to_string()) {
-            bail!(
-                "tar already contains {RTLD_AUDIT_TAR_PATH} -- \
-                 remove the conflicting entry or use --no-rewrite"
-            );
-        }
-        tar_entries.push(TarEntry {
-            tar_path: RTLD_AUDIT_TAR_PATH.to_string(),
-            data: include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).to_vec(),
-            mode: 0o755,
-        });
-    }
-
+/// Build the output tar and print a size summary.
+fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()> {
     // Build tar.
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
@@ -394,17 +403,20 @@ fn finalize_tar(
 // Dependency discovery (via ldd)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 struct ResolvedDep {
     ldd_path: PathBuf,
     real_path: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 struct DepDiscoveryResult {
     resolved: Vec<ResolvedDep>,
     missing: Vec<String>,
 }
 
 /// Run `ldd` on the given ELF and return resolved dependencies.
+#[cfg(target_os = "linux")]
 fn find_dependencies(elf_path: &Path, verbose: bool) -> anyhow::Result<DepDiscoveryResult> {
     let output = std::process::Command::new("ldd")
         .arg(elf_path)
@@ -496,6 +508,7 @@ fn find_dependencies(elf_path: &Path, verbose: bool) -> anyhow::Result<DepDiscov
 /// appear in the tar. This includes the input files themselves and all their
 /// transitive shared-library dependencies. Deduplicates by canonical path so each
 /// file is only read and rewritten once.
+#[cfg(target_os = "linux")]
 fn discover_all_dependencies(
     input_files: &[PathBuf],
     verbose: bool,
@@ -549,6 +562,36 @@ fn discover_all_dependencies(
 /// ELF magic bytes: `\x7fELF`.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
+/// ELF e_machine value for x86_64.
+const EM_X86_64: u16 = 62;
+/// ELF e_machine value for AArch64.
+const EM_AARCH64: u16 = 183;
+
+/// Read the ELF e_machine field using the `object` crate for proper header parsing.
+fn elf_machine(data: &[u8]) -> Option<u16> {
+    use object::read::elf::FileHeader;
+    if let Ok(header) = object::elf::FileHeader64::<object::Endianness>::parse(data) {
+        let endian = header.endian().ok()?;
+        Some(header.e_machine(endian))
+    } else if let Ok(header) = object::elf::FileHeader32::<object::Endianness>::parse(data) {
+        let endian = header.endian().ok()?;
+        Some(header.e_machine(endian))
+    } else {
+        None
+    }
+}
+
+/// Returns the expected ELF e_machine value for the current target architecture.
+fn target_elf_machine() -> u16 {
+    if cfg!(target_arch = "x86_64") {
+        EM_X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        EM_AARCH64
+    } else {
+        0 // Unknown — skip arch check
+    }
+}
+
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
 ///
 /// Non-ELF files (shell scripts, data files with executable bits, etc.) are
@@ -556,13 +599,27 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
+fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
             eprintln!("  {} (not ELF, skipping rewrite)", path.display());
         }
-        return Ok(data.to_vec());
+        return data.to_vec();
+    }
+
+    // Skip ELF files whose architecture doesn't match the target. OCI images
+    // may contain cross-architecture binaries (e.g., aarch64 in an x86_64
+    // image) which the rewriter cannot handle.
+    let target_machine = target_elf_machine();
+    if target_machine != 0 && elf_machine(data).is_some_and(|machine| machine != target_machine) {
+        if verbose {
+            eprintln!(
+                "  {} (wrong ELF architecture, skipping rewrite)",
+                path.display()
+            );
+        }
+        return data.to_vec();
     }
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
@@ -570,9 +627,19 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
-            Ok(rewritten)
+            rewritten
         }
-        Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
+        Err(e) => {
+            // Include the file as-is when rewriting fails. This can happen for
+            // ELFs with unsupported architectures (e.g., aarch64 binaries in an
+            // x86_64 image) or unusual ELF layouts. The runtime patcher or
+            // platform syscall interception will handle these at execution time.
+            eprintln!(
+                "  warning: failed to rewrite {}: {e}; including as-is",
+                path.display()
+            );
+            data.to_vec()
+        }
     }
 }
 
@@ -592,7 +659,11 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     let mut builder = Builder::new(file);
 
     for entry in entries {
-        let mut header = Header::new_gnu();
+        // Note: we use the ustar format because the runtime tar filesystem
+        // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
+        // supports ustar. This limits path lengths to 256 bytes (with the
+        // name/prefix split).
+        let mut header = Header::new_ustar();
         header.set_size(entry.data.len() as u64);
         // Mask to permission bits only (rwxrwxrwx). The full st_mode from
         // MetadataExt::mode() includes file type bits (e.g., 0o100755) which
