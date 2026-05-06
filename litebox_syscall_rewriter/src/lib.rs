@@ -344,28 +344,30 @@ fn hook_syscalls_in_section(
         let replace_end = inst.next_ip();
 
         let mut replace_start = None;
-        for inst_id in (0..=i).rev() {
-            let prev_inst = &instructions[inst_id];
-            // Check if the instruction does control transfer
-            // TODO: Check if the instruction is an instruction-relative control transfer
-            let is_control_transfer =
-                inst_id != i && prev_inst.flow_control() != iced_x86::FlowControl::Next;
-            if is_control_transfer {
-                // If it's a control transfer, we don't want to cross it
-                break;
-            }
-            if replace_end - prev_inst.ip() >= 5 {
-                replace_start = Some(prev_inst.ip());
-                break;
-            } else if control_transfer_targets.contains(&prev_inst.ip()) {
-                // If the previous instruction is a control transfer target, we don't want to cross it
-                break;
+        let mut replace_start_idx = 0;
+        // If the syscall itself is a control transfer target, we cannot extend
+        // the replaced range backward (a jump landing on the syscall would hit
+        // NOPs instead). Skip the backward scan and fall through to the
+        // forward-only path (hook_syscall_and_after).
+        if !control_transfer_targets.contains(&inst.ip()) {
+            for inst_id in (0..i).rev() {
+                let prev_inst = &instructions[inst_id];
+                if prev_inst.flow_control() != iced_x86::FlowControl::Next {
+                    break;
+                }
+                if replace_end - prev_inst.ip() >= 5 {
+                    replace_start = Some(prev_inst.ip());
+                    replace_start_idx = inst_id;
+                    break;
+                } else if control_transfer_targets.contains(&prev_inst.ip()) {
+                    // If the previous instruction is a control transfer target, we don't want to cross it
+                    break;
+                }
             }
         }
 
         if replace_start.is_none() {
             match hook_syscall_and_after(
-                arch,
                 control_transfer_targets,
                 section_base_addr,
                 section_data,
@@ -396,13 +398,37 @@ fn hook_syscalls_in_section(
             "syscall trampoline target",
         )?;
 
-        // Copy the original instructions to the trampoline
-        if replace_start < inst.ip() {
-            trampoline_data.extend_from_slice(
-                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
-            );
-        }
+        // Encode the pre-syscall instructions for the trampoline, re-encoding
+        // any RIP-relative memory operands for the new location.
+        let presyscall_bytes = if replace_start < inst.ip() {
+            if let Some(bytes) =
+                reencode_instructions(&instructions[replace_start_idx..i], target_addr)
+            {
+                bytes
+            } else {
+                match hook_syscall_and_after(
+                    control_transfer_targets,
+                    section_base_addr,
+                    section_data,
+                    trampoline_base_addr,
+                    syscall_entry_addr,
+                    trampoline_data,
+                    &instructions,
+                    i,
+                ) {
+                    Ok(()) => {}
+                    Err(InternalError::InsufficientBytesBeforeOrAfter) => {
+                        replace_with_trap(section_data, section_base_addr, inst);
+                        skipped_addrs.push(inst.ip());
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+        } else {
+            Vec::new()
+        };
+        trampoline_data.extend_from_slice(&presyscall_bytes);
 
         let return_addr = inst.next_ip();
         // Put jump back location into rcx.
@@ -753,9 +779,33 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
     Ok(&mut buf[offset..end])
 }
 
+/// Re-encode a sequence of instructions at a new base address, fixing up
+/// RIP-relative memory operands and IP-relative branch targets so they still
+/// reference the same absolute addresses.  Returns `Some(bytes)` on success,
+/// or `None` if any instruction cannot be re-encoded at the same length (which
+/// would shift subsequent offsets and break the 1:1 replacement).
+fn reencode_instructions(
+    instructions: &[iced_x86::Instruction],
+    base_addr: u64,
+) -> Option<Vec<u8>> {
+    let mut reencoded = Vec::new();
+    let mut encoder = iced_x86::Encoder::new(64);
+    for inst in instructions {
+        let tramp_ip = base_addr + reencoded.len() as u64;
+        if encoder.encode(inst, tramp_ip).is_err() {
+            return None;
+        }
+        let bytes = encoder.take_buffer();
+        if bytes.len() != inst.len() {
+            return None;
+        }
+        reencoded.extend_from_slice(&bytes);
+    }
+    Some(reencoded)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    _arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -769,26 +819,22 @@ fn hook_syscall_and_after(
 
     let replace_start = syscall_inst.ip();
     let mut replace_end = None;
+    let mut replace_end_idx = inst_index;
 
-    for next_inst in instructions.iter().skip(inst_index) {
-        if next_inst.code() != syscall_inst.code()
-            && control_transfer_targets.contains(&next_inst.ip())
-        {
+    for (idx, next_inst) in instructions.iter().enumerate().skip(inst_index + 1) {
+        if control_transfer_targets.contains(&next_inst.ip()) {
             // If the next instruction is a control transfer target, we don't want to cross it
-            break;
-        }
-        // Check if the instruction does control transfer
-        // TODO: Check if the instruction is an instruction-relative control transfer
-        let is_control_transfer = next_inst.code() != syscall_inst.code()
-            && next_inst.flow_control() != iced_x86::FlowControl::Next;
-        if is_control_transfer {
-            // If it's a control transfer, we don't want to cross it
             break;
         }
         let next_end = next_inst.next_ip();
 
         if next_end - syscall_inst.ip() >= 5 {
             replace_end = Some(next_end);
+            replace_end_idx = idx + 1;
+            break;
+        }
+
+        if next_inst.flow_control() != iced_x86::FlowControl::Next {
             break;
         }
     }
@@ -804,6 +850,27 @@ fn hook_syscall_and_after(
         trampoline_data.len() as u64,
         "syscall trampoline target",
     )?;
+
+    // Compute preamble size so we can determine where post-syscall
+    // instructions will land and encode them before committing anything.
+    // x86_64: LEA RCX,[RIP+disp32] (7) + JMP [RIP+disp32] (6) = 13
+    let preamble_len: u64 = 13;
+
+    // Encode the post-syscall instructions for the trampoline, re-encoding
+    // any RIP-relative memory operands for the new location.
+    let syscall_inst_end = syscall_inst.next_ip();
+    let postsyscall_bytes = if syscall_inst_end < replace_end {
+        let postsyscall_target = target_addr + preamble_len;
+        match reencode_instructions(
+            &instructions[(inst_index + 1)..replace_end_idx],
+            postsyscall_target,
+        ) {
+            Some(bytes) => bytes,
+            None => return Err(InternalError::InsufficientBytesBeforeOrAfter),
+        }
+    } else {
+        Vec::new()
+    };
 
     // Put jump back location into rcx, via lea rcx, [next instruction]
     trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
@@ -823,14 +890,7 @@ fn hook_syscall_and_after(
         "x86_64 trampoline entry",
     )?);
 
-    // Copy the original instructions to the trampoline
-    let syscall_inst_end = syscall_inst.next_ip();
-    if syscall_inst_end < replace_end {
-        trampoline_data.extend_from_slice(
-            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
-                ..usize::try_from(replace_end - section_base_addr).unwrap()],
-        );
-    }
+    trampoline_data.extend_from_slice(&postsyscall_bytes);
 
     // Add jmp back to original after syscall
     let jmp_back_base = checked_add_u64(
