@@ -1765,6 +1765,7 @@ macro_rules! XRSTOR_VTL1_ASM {
 ///
 /// Prerequisite:
 /// - Store user `rsp` in `r11` before calling this macro.
+/// - Store user `rflags` in `gs:[user_rflags]` before calling this macro.
 /// - Store the userspace return address in `rcx` (`syscall` does this automatically).
 #[cfg(target_arch = "x86_64")]
 macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
@@ -1772,7 +1773,7 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
         "
         push 0x2b       // pt_regs->ss = __USER_DS
         push r11        // pt_regs->rsp
-        pushfq          // pt_regs->eflags
+        push qword ptr gs:[{user_rflags_off}] // pt_regs->eflags
         push 0x33       // pt_regs->cs = __USER_CS
         push rcx        // pt_regs->rip
         push rax        // pt_regs->orig_rax
@@ -1926,6 +1927,7 @@ unsafe extern "C" fn run_thread_arch(
         ".globl syscall_callback",
         "syscall_callback:",
         "swapgs",
+        "mov gs:[{user_rflags_off}], r11", // store user `rflags`.
         "mov r11, rsp", // store user `rsp` in `r11`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
@@ -1945,6 +1947,8 @@ unsafe extern "C" fn run_thread_arch(
         // - GS = user (swapgs has NOT happened yet)
         ".globl exception_callback",
         "exception_callback:",
+        "cld",
+        "clac",
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov al, [rsp]",
@@ -2038,6 +2042,7 @@ unsafe extern "C" fn run_thread_arch(
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
+        user_rflags_off = const { PerCpuVariablesAsm::user_rflags_offset() },
         exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
         is_in_user_off = const { PerCpuVariablesAsm::is_in_user_offset() },
         init_handler = sym init_handler,
