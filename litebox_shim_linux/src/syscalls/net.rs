@@ -27,8 +27,9 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
-    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno, signal::Signal,
+    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
+    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -1761,7 +1762,7 @@ impl<FS: ShimFS> Task<FS> {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             },
-            |file| Ok(SocketAddress::Unix(file.get_local_addr())),
+            |unix| Ok(SocketAddress::Unix(unix.get_local_addr())),
         )
     }
 
@@ -1794,6 +1795,33 @@ impl<FS: ShimFS> Task<FS> {
                 file.get_peer_addr()
                     .ok_or(Errno::ENOTCONN)
                     .map(SocketAddress::Unix)
+            },
+        )
+    }
+
+    /// Handle syscall `shutdown`
+    pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        self.do_shutdown(sockfd, how)
+    }
+    fn do_shutdown(&self, sockfd: u32, how: i32) -> Result<(), Errno> {
+        // Linux validates the fd (EBADF, ENOTSOCK) before `how` (EINVAL),
+        // so resolve the socket through `with_socket` first and validate `how`
+        // only inside the matching branch.
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |_fd| {
+                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                log_unsupported!("shutdown on inet socket");
+                Err(Errno::EOPNOTSUPP)
+            },
+            |file| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                file.shutdown(how);
+                Ok(())
             },
         )
     }
@@ -3071,7 +3099,8 @@ mod unix_tests {
             .do_recvfrom(sock1, &mut buf, ReceiveFlags::empty(), None)
             .unwrap_err();
         let elapsed = start.elapsed();
-        assert_eq!(err, Errno::ETIMEDOUT);
+        // Linux returns EAGAIN (not ETIMEDOUT) when SO_RCVTIMEO expires on a blocking recv.
+        assert_eq!(err, Errno::EAGAIN);
         // Allow a small tolerance (5ms) for timing imprecision
         let tolerance = Duration::from_millis(5);
         assert!(

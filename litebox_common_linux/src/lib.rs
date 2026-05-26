@@ -1725,6 +1725,31 @@ pub enum SocketcallType {
     Sendmmsg = 20,
 }
 
+/// `how` argument to the `shutdown(2)` syscall.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, IntEnum)]
+pub enum ShutdownHow {
+    /// `SHUT_RD`.
+    Read = 0,
+    /// `SHUT_WR`.
+    Write = 1,
+    /// `SHUT_RDWR`.
+    Both = 2,
+}
+
+impl ShutdownHow {
+    /// Returns `true` when this `how` disables the receive side (`SHUT_RD` or `SHUT_RDWR`).
+    #[must_use]
+    pub fn is_shutdown_read(self) -> bool {
+        matches!(self, Self::Read | Self::Both)
+    }
+    /// Returns `true` when this `how` disables the send side (`SHUT_WR` or `SHUT_RDWR`).
+    #[must_use]
+    pub fn is_shutdown_write(self) -> bool {
+        matches!(self, Self::Write | Self::Both)
+    }
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1916,6 +1941,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
         flags: ReceiveFlags,
+    },
+    Shutdown {
+        sockfd: i32,
+        how: i32,
     },
     Bind {
         sockfd: i32,
@@ -2366,6 +2395,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => sys_req!(Setsockopt {
