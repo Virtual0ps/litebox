@@ -902,6 +902,30 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                statxbuf,
+            } => {
+                let (path, flags) = match pathname {
+                    // Linux 6.11+ treats a NULL statx path as a request to stat dirfd.
+                    None => (
+                        Ok(c"".into()),
+                        flags | litebox_common_linux::AtFlags::AT_EMPTY_PATH,
+                    ),
+                    Some(p) => (p.to_cstring().ok_or(Errno::EFAULT), flags),
+                };
+                path.and_then(|path| {
+                    self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
+                        statxbuf
+                            .write_at_offset(0, sx)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
