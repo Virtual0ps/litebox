@@ -323,7 +323,7 @@ impl SyscallContext {
     /// Panics if the index is out of bounds (greater than 7).
     pub fn syscall_arg(&self, index: usize) -> usize {
         if index >= MAX_SYSCALL_ARGS {
-            panic!("BUG: Invalid syscall argument index: {}", index);
+            panic!("BUG: Invalid syscall argument index: {index}");
         } else {
             self.args[index]
         }
@@ -2331,8 +2331,8 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     for shdr in shdrs {
         let name = strtab.get(shdr.sh_name as usize).ok()?;
         if name == TA_HEAD_SECTION_NAME {
-            let offset: usize = shdr.sh_offset.truncate();
-            let size: usize = shdr.sh_size.truncate();
+            let offset: usize = shdr.sh_offset.trunc();
+            let size: usize = shdr.sh_size.trunc();
 
             if size < size_of::<TaHead>() {
                 return None;
